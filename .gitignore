@@ -1,0 +1,51 @@
+# --- СЫРЫЕ ДАННЫЕ И РЕЗУЛЬТАТЫ ---
+01_raw_data/
+04_processed_db/
+*.fif
+*.fif.gz
+*.h5
+*.zarr
+*.csv
+*.tsv
+*.xlsx
+
+# --- СЕКРЕТЫ И ПАРОЛИ ---
+.env
+*.pem
+*.key
+password_to_authorization_file.txt
+credentials.json
+secrets/
+docker_password.txt
+# --- ВРЕМЕННЫЕ ФАЙЛЫ И ЛОГИ ---
+05_logs/
+*.log
+__pycache__/
+.pytest_cache/
+.ipynb_checkpoints/
+*.sif   # Контейнеры хранятся локально/на кластере, а не в Git
+auth_key_edu.pem
+auth_key.pem
+password_to_authorization_file.txt
+docker_password.txt
+# Секреты и ключи
+auth_key.pem
+auth_key_edu.pem
+password_to_authorization_file.txt
+docker_password.txt
+.ssh_config
+.env
+
+# Данные и базы
+01_raw_data/
+04_processed_db/
+05_logs/
+*.pysz
+*.fif
+*.h5
+*.zarr
+*.sif
+
+# Служебные файлы
+__pycache__/
+.ipynb_checkpoints/

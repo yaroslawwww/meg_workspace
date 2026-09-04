@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+
+# Определяем корень проекта относительно самого скрипта
+WORKSPACE_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+SSH_CONF="${WORKSPACE_DIR}/.ssh_config"
+
+# --- КОМАНДА: ПОДКЛЮЧЕНИЕ К НОВОМУ ЛОГИН-УЗЛУ ---
+cmd_connect() {
+    echo "🚀 Подключение к login-02 (cHARISMa ВШЭ)..."
+    ssh -F "${SSH_CONF}" hse-work
+}
+cmd_connect_edu() {
+    echo "🚀 Подключение к login-02 (cHARISMa ВШЭ)..."
+    ssh -F "${SSH_CONF}" hse-edu
+}
+# --- ЗАГРУЗКА НА КЛАСТЕР (PUSH) ---
+cmd_push() {
+    local include_heavy=false
+    local extra_args=()
+
+    # Разбор аргументов
+    for arg in "$@"; do
+        if [[ "$arg" == "--all" || "$arg" == "--with-data" ]]; then
+            include_heavy=true
+        else
+            extra_args+=("$arg")
+        fi
+    done
+
+    # Базовые исключения (секреты и служебные файлы)
+    local excludes=(
+        "--exclude=.git/"
+        "--exclude=__pycache__/"
+        "--exclude=*.sif"
+        "--exclude=.ssh_config"
+        "--exclude=auth_key.pem"
+        "--exclude=password_to_authorization_file.txt"
+    )
+
+    if [ "$include_heavy" = false ]; then
+        echo "📤 Синхронизация на кластер (ЛЕГКИЙ РЕЖИМ: без сырья и БД)..."
+        excludes+=(
+            "--exclude=01_raw_data/"
+            "--exclude=04_processed_db/"
+            "--exclude=*.fif"
+            "--exclude=*.fif.gz"
+            "--exclude=*.h5"
+            "--exclude=*.zarr"
+        )
+    else
+        echo "📤 Синхронизация на кластер (ПОЛНЫЙ РЕЖИМ: включая сырье и БД)..."
+    fi
+
+    rsync -avz -e "ssh -F ${SSH_CONF}" "${excludes[@]}" "${extra_args[@]}" "${WORKSPACE_DIR}/" hse-work:~/meg_entropy_workspace/
+    echo "✅ Загрузка на кластер завершена!"
+}
+
+# --- ВЫГРУЗКА С КЛАСТЕРА (PULL) ---
+cmd_pull() {
+    local include_heavy=false
+    local extra_args=()
+
+    # Разбор аргументов
+    for arg in "$@"; do
+        if [[ "$arg" == "--all" || "$arg" == "--with-data" ]]; then
+            include_heavy=true
+        else
+            extra_args+=("$arg")
+        fi
+    done
+
+    # Базовые исключения
+    local excludes=(
+        "--exclude=.git/"
+        "--exclude=__pycache__/"
+        "--exclude=*.sif"
+        "--exclude=.ssh_config"
+        "--exclude=auth_key.pem"
+        "--exclude=password_to_authorization_file.txt"
+        "--exclude=docker_build.sh"
+        "--exclude=docker_password.txt"
+    )
+
+    if [ "$include_heavy" = false ]; then
+        echo "📥 Скачивание с кластера (ЛЕГКИЙ РЕЖИМ: только код, логи и манифесты)..."
+        excludes+=(
+            "--exclude=01_raw_data/"
+            "--exclude=04_processed_db/"
+            "--exclude=*.fif"
+            "--exclude=*.fif.gz"
+            "--exclude=*.h5"
+            "--exclude=*.zarr"
+        )
+    else
+        echo "📥 Скачивание с кластера (ПОЛНЫЙ РЕЖИМ: включая тяжелые БД)..."
+    fi
+
+    rsync -avz -e "ssh -F ${SSH_CONF}" "${excludes[@]}" "${extra_args[@]}" hse-work:~/meg_entropy_workspace/ "${WORKSPACE_DIR}/"
+    echo "✅ Скачивание с кластера завершено!"
+}
+
+
+# --- ДИНАМИЧЕСКИЙ МАРШРУТИЗАТОР ЗАПУСКА (RUN) ---
+cmd_run() {
+    local mode="$1"
+    local py_script="$2"
+    local time_limit="$3"      # Формат Slurm: ДНИ-ЧАСЫ:МИНУТЫ:СЕКУНДЫ (напр. 0-02:00:00 или 1-00:00:00)
+    local resource_count="$4"  # Число GPU / Задач / Ядер
+
+    if [[ -z "$mode" || -z "$py_script" || -z "$time_limit" || -z "$resource_count" ]]; then
+        echo "❌ Ошибка! Все 4 параметра обязательны."
+        echo "Синтаксис:"
+        echo "  ./hpc run <gpu|cpu_many|cpu_multi> <путь_к_py> <время> <количество_ресурсов>"
+        echo ""
+        echo "Примеры:"
+        echo "  ./hpc run gpu week_01/test.py 0-02:00:00 1       (1 GPU, 2 часа)"
+        echo "  ./hpc run cpu_many week_01/test.py 0-05:00:00 64 (64 задачи по 1 ядру, 5 часов)"
+        echo "  ./hpc run cpu_multi week_01/test.py 1-00:00:00 32(1 задача на 32 ядра, 24 часа)"
+        return 1
+    fi
+
+    local sbatch_script=""
+    local sbatch_flags=("--time=${time_limit}")
+
+    case "$mode" in
+        gpu)
+            sbatch_script="03_hpc_jobs/run_gpu.sh"
+            sbatch_flags+=(
+                "--nodes=1"
+                "--ntasks=1"
+                "--gpus=${resource_count}"
+                "--cpus-per-task=1"
+            )
+            echo "🚀 [Запуск GPU] Видеокарт: ${resource_count} | Время: ${time_limit}"
+            ;;
+        cpu_many)
+            sbatch_script="03_hpc_jobs/run_cpu_many_single.sh"
+            sbatch_flags+=(
+                "--nodes=1"
+                "--ntasks=${resource_count}"
+                "--cpus-per-task=1"
+            )
+            echo "🚀 [Запуск CPU-Many] Задач по 1 ядру: ${resource_count} | Время: ${time_limit}"
+            ;;
+        cpu_multi)
+            sbatch_script="03_hpc_jobs/run_cpu_single_multi.sh"
+            sbatch_flags+=(
+                "--nodes=1"
+                "--ntasks=1"
+                "--cpus-per-task=${resource_count}"
+            )
+            echo "🚀 [Запуск CPU-Multi] 1 задача на ${resource_count} ядер | Время: ${time_limit}"
+            ;;
+        *)
+            echo "❌ Неизвестный режим: $mode. Допустимые: gpu, cpu_many, cpu_multi"
+            return 1
+            ;;
+    esac
+
+    # Отправка сформированной команды в Slurm
+    ssh -F "${SSH_CONF}" hse-work "cd ~/meg_entropy_workspace && sbatch ${sbatch_flags[*]} ${sbatch_script} ${py_script}"
+}
+# --- СПРАВКА ---
+cmd_help() {
+    echo "Утилита управления HPC (cHARISMa ВШЭ):"
+    echo "  ./hpc connect                      - Подключение к login-02 (рабочий аккаунт)"
+    echo "  ./hpc push [--all]                 - Синхронизация кода/данных на кластер"
+    echo "  ./hpc pull [--all]                 - Скачивание результатов с кластера"
+    echo "  ./hpc run gpu <py_script> [time]   - Запуск на 1 GPU"
+    echo "  ./hpc run cpu_many <py_script> [time] [ntasks] - Запуск много по 1 CPU"
+    echo "  ./hpc run cpu_multi <py_script> [time] [ncpus]  - Запуск 1 задачи на N CPU"
+}
+
+
+# --- МАРШРУТИЗАЦИЯ КОМАНД ---
+case "$1" in
+    connect)
+        cmd_connect
+        ;;
+    connect_edu)
+        cmd_connect_edu
+        ;;
+    push)
+        shift; cmd_push "$@"
+        ;;
+    pull)
+        shift; cmd_pull "$@"
+        ;;
+    run)
+        shift; cmd_run "$@"
+        ;;
+    *)
+        cmd_help
+        ;;
+esac
