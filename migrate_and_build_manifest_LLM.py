@@ -55,11 +55,11 @@ for d in [TYPE1_DIR, TYPE2_DIR, TYPE3_DIR, EMPTY_ROOMS_DIR, ANNOTATIONS_DIR]:
 # Гарантирует погрешность сжатия строго ниже собственного шума сенсоров
 # Оптимизированные пороги ABS (гарантируют 99%+ даже на тихом шуме)
 ABS_BOUNDS = {
-    "mag": 1e-15,   # 1 fT      (уже работает идеально: 99.74%)
-    "grad": 1e-15,  # 0.2 fT/cm (уменьшено в 5 раз, поднимет GRAD до 99%)
-    "eeg": 1e-8,    # 0.01 uV   
-    "eog": 5e-8,    # 0.05 uV   
-    "ecg": 1e-7,    # 0.1 uV    
+    "mag": 1e-15,
+    "grad": 1e-15,
+    "eeg": 1e-9,
+    "eog": 1e-9,
+    "ecg": 1e-9,
 }
 
 DEFAULT_ABS_BOUND = 1e-7
@@ -138,22 +138,22 @@ def compress_to_pysz(src_path: Path, dst_pysz_path: Path):
         ch_data, _ = raw[batch_chs, :]
 
         # Параллельный FIR-фильтр на 4 ядрах (проектируется всего 1 раз на батч)
-        filtered = mne.filter.filter_data(
-            ch_data,
-            sfreq=sfreq,
-            l_freq=1.0,
-            h_freq=45.0,
-            method="fir",
-            phase="zero",
-            fir_window="hamming",
-            n_jobs=N_JOBS,  # <--- Использование 4 ядер
-            copy=False,
-            verbose=False,
-        ).astype(np.float32)
+        # filtered = mne.filter.filter_data(
+        #     ch_data,
+        #     sfreq=sfreq,
+        #     l_freq=1.0,
+        #     h_freq=45.0,
+        #     method="fir",
+        #     phase="zero",
+        #     fir_window="hamming",
+        #     n_jobs=N_JOBS,  # <--- Использование 4 ядер
+        #     copy=False,
+        #     verbose=False,
+        # ).astype(np.float32)
 
         # Подготовка задач для параллельной компрессии SZ3
         tasks = [
-            (ch_idx, np.ascontiguousarray(filtered[i]), ch_types[ch_idx])
+            (ch_idx, np.ascontiguousarray(ch_data[i]), ch_types[ch_idx])
             for i, ch_idx in enumerate(batch_chs)
         ]
 
@@ -162,7 +162,7 @@ def compress_to_pysz(src_path: Path, dst_pysz_path: Path):
             for ch_idx, c_bytes in executor.map(_compress_single_channel_task, tasks):
                 compressed_chunks[ch_idx] = c_bytes
 
-        del ch_data, filtered, tasks
+        del ch_data, tasks
         gc.collect()
 
         logger.info(f"  Прогресс батчей: {batch_idx + 1}/{n_batches} обработано")

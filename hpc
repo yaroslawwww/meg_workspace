@@ -51,25 +51,43 @@ cmd_push() {
         echo "📤 Синхронизация на кластер (ПОЛНЫЙ РЕЖИМ: включая сырье и БД)..."
     fi
 
-    rsync -avz -e "ssh -F ${SSH_CONF}" "${excludes[@]}" "${extra_args[@]}" "${WORKSPACE_DIR}/" hse-work:~/meg_entropy_workspace/
+    # Добавлен флаг --info=progress2 для отображения общего прогресса
+    rsync -avz --info=progress2 -e "ssh -F ${SSH_CONF}" "${excludes[@]}" "${extra_args[@]}" "${WORKSPACE_DIR}/" hse-work:~/meg_entropy_workspace/
     echo "✅ Загрузка на кластер завершена!"
 }
 
+
+# --- ВЫГРУЗКА С КЛАСТЕРА (PULL) ---
 # --- ВЫГРУЗКА С КЛАСТЕРА (PULL) ---
 cmd_pull() {
     local include_heavy=false
+    local include_db=false
+    local target_path=""
     local extra_args=()
 
     # Разбор аргументов
-    for arg in "$@"; do
-        if [[ "$arg" == "--all" || "$arg" == "--with-data" ]]; then
-            include_heavy=true
-        else
-            extra_args+=("$arg")
-        fi
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --all|--with-data)
+                include_heavy=true
+                shift
+                ;;
+            --with-db)
+                include_db=true
+                shift
+                ;;
+            --target)
+                target_path="$2"
+                shift 2
+                ;;
+            *)
+                extra_args+=("$1")
+                shift
+                ;;
+        esac
     done
 
-    # Базовые исключения
+    # Базовые исключения (всегда исключаем скрытые и технические файлы)
     local excludes=(
         "--exclude=.git/"
         "--exclude=__pycache__/"
@@ -81,7 +99,34 @@ cmd_pull() {
         "--exclude=docker_password.txt"
     )
 
-    if [ "$include_heavy" = false ]; then
+    # Логика фильтрации в зависимости от флагов
+    if [ -n "$target_path" ]; then
+        echo "🎯 Скачивание конкретной цели: ${target_path}..."
+        # Важно: rsync требует включения родительских папок, чтобы добраться до файла.
+        # Поэтому мы используем хитрый трюк с --include и --exclude="*"
+        rsync -avz -e "ssh -F ${SSH_CONF}" \
+            "${excludes[@]}" \
+            --include="*/" \
+            --include="${target_path}" \
+            --exclude="*" \
+            "${extra_args[@]}" hse-work:~/meg_entropy_workspace/ "${WORKSPACE_DIR}/"
+        
+        echo "✅ Скачивание цели завершено!"
+        return 0
+    fi
+
+    if [ "$include_heavy" = true ]; then
+        echo "📥 Скачивание с кластера (ПОЛНЫЙ РЕЖИМ: включая ВСЕ тяжелые данные и БД)..."
+    elif [ "$include_db" = true ]; then
+        echo "📥 Скачивание с кластера (РЕЖИМ С БД: код, логи + папка 04_processed_db)..."
+        excludes+=(
+            "--exclude=01_raw_data/"
+            "--exclude=*.fif"
+            "--exclude=*.fif.gz"
+            "--exclude=*.h5"
+            "--exclude=*.zarr"
+        )
+    else
         echo "📥 Скачивание с кластера (ЛЕГКИЙ РЕЖИМ: только код, логи и манифесты)..."
         excludes+=(
             "--exclude=01_raw_data/"
@@ -91,13 +136,12 @@ cmd_pull() {
             "--exclude=*.h5"
             "--exclude=*.zarr"
         )
-    else
-        echo "📥 Скачивание с кластера (ПОЛНЫЙ РЕЖИМ: включая тяжелые БД)..."
     fi
 
     rsync -avz -e "ssh -F ${SSH_CONF}" "${excludes[@]}" "${extra_args[@]}" hse-work:~/meg_entropy_workspace/ "${WORKSPACE_DIR}/"
     echo "✅ Скачивание с кластера завершено!"
 }
+
 
 
 # --- ДИНАМИЧЕСКИЙ МАРШРУТИЗАТОР ЗАПУСКА (RUN) ---
@@ -125,22 +169,32 @@ cmd_run() {
     case "$mode" in
         gpu)
             sbatch_script="03_hpc_jobs/run_gpu.sh"
-            sbatch_flags+=(
-                "--nodes=1"
-                "--ntasks=1"
-                "--gpus=${resource_count}"
-                "--cpus-per-task=1"
-            )
-            echo "🚀 [Запуск GPU] Видеокарт: ${resource_count} | Время: ${time_limit}"
+            if [ "${resource_count}" -gt 1 ]; then
+                local array_range="0-$((resource_count - 1))"
+                sbatch_flags+=(
+                    "--array=${array_range}"
+                    "--gpus=1"
+                    "--cpus-per-task=1"
+                )
+                echo "🚀 [Запуск GPU (Array)] ${resource_count} задач (по 1 GPU на задачу) | Диапазон: ${array_range} | Время: ${time_limit}"
+            else
+                sbatch_flags+=(
+                    "--nodes=1"
+                    "--ntasks=1"
+                    "--gpus=1"
+                    "--cpus-per-task=1"
+                )
+                echo "🚀 [Запуск GPU (Single)] 1 GPU | Время: ${time_limit}"
+            fi
             ;;
         cpu_many)
             sbatch_script="03_hpc_jobs/run_cpu_many_single.sh"
+            local array_range="0-$((resource_count - 1))%20"
             sbatch_flags+=(
-                "--nodes=1"
-                "--ntasks=${resource_count}"
+                "--array=${array_range}"
                 "--cpus-per-task=1"
             )
-            echo "🚀 [Запуск CPU-Many] Задач по 1 ядру: ${resource_count} | Время: ${time_limit}"
+            echo "🚀 [Запуск CPU-Many (Array)] Диапазон: ${array_range} | Время: ${time_limit}"
             ;;
         cpu_multi)
             sbatch_script="03_hpc_jobs/run_cpu_single_multi.sh"
@@ -158,7 +212,7 @@ cmd_run() {
     esac
 
     # Отправка сформированной команды в Slurm
-    ssh -F "${SSH_CONF}" hse-work "cd ~/meg_entropy_workspace && sbatch ${sbatch_flags[*]} ${sbatch_script} ${py_script}"
+    ssh -F "${SSH_CONF}" hse-work "cd ~/meg_entropy_workspace && mkdir -p 05_logs && sbatch ${sbatch_flags[*]} ${sbatch_script} ${py_script}"
 }
 # --- СПРАВКА ---
 cmd_help() {

@@ -45,7 +45,10 @@ docker_password.txt
 *.h5
 *.zarr
 *.sif
-
+*.txt
+*.pdf
+*.ssh*
+*.idea
 # Служебные файлы
 __pycache__/
 .ipynb_checkpoints/

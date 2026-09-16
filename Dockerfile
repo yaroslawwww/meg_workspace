@@ -54,6 +54,7 @@ RUN pip install --no-cache-dir \
     "scikit-image>=0.25.0" \
     "mef3io" \
     "pysz"
+    "polars"
 
 
 # 7. Ускорение вычислений NVIDIA RAPIDS (ТРЕБУЕТСЯ --extra-index-url)
