@@ -35,6 +35,7 @@ cmd_push() {
         "--exclude=.ssh_config"
         "--exclude=auth_key.pem"
         "--exclude=password_to_authorization_file.txt"
+        "--exclude=05_logs/"
     )
 
     if [ "$include_heavy" = false ]; then
