@@ -250,22 +250,24 @@ def assemble_error_hamiltonian(
     assembled = sum_of_squared_operators.unsqueeze(0) - linear_contraction + point_term
     return hermitian_part(assembled)
 
-def stable_complex_eigh(hamiltonian: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    diagonal_mean = hamiltonian.diagonal(dim1=-2, dim2=-1).real.mean(dim=-1)
-    centered = hamiltonian - diagonal_mean.view(-1, 1, 1)
-    eigenvalues_centered, eigenvectors = torch.linalg.eigh(centered)
-    eigenvalues = eigenvalues_centered + diagonal_mean.view(-1, 1)
-    return eigenvalues, eigenvectors
+def complex_eigh(hamiltonian: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    matrix = hermitian_part(hamiltonian)
+    if not torch.is_grad_enabled():
+        eigenvalues, eigenvectors = torch.linalg.eigh(matrix.to(torch.complex128))
+        return eigenvalues.to(torch.float32), eigenvectors.to(torch.complex64)
+    return torch.linalg.eigh(matrix)
+
+
 
 def lowest_eigenpair(hamiltonian: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    eigenvalues, eigenvectors = stable_complex_eigh(hamiltonian)
+    eigenvalues, eigenvectors = complex_eigh(hamiltonian)
     return eigenvalues[:, 0].to(torch.float32), eigenvectors[:, :, 0].to(torch.complex64)
 
 
 def ground_and_excited_eigenpairs(
     hamiltonian: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    eigenvalues, eigenvectors = stable_complex_eigh(hamiltonian)
+    eigenvalues, eigenvectors = complex_eigh(hamiltonian)
     ground_eigenvalue = eigenvalues[:, 0].to(torch.float32)
     ground_state = eigenvectors[:, :, 0].to(torch.complex64)
     excited_eigenvalues = eigenvalues[:, 1:].to(torch.float32)
@@ -290,13 +292,15 @@ def compute_coordinate_expectations(
     ground_state: torch.Tensor,
     hermitian_operators: torch.Tensor,
 ) -> torch.Tensor:
+    symmetrized_operators = hermitian_part(hermitian_operators)
     expectations = torch.einsum(
         "bn, dnm, bm -> bd",
         ground_state.conj(),
-        hermitian_operators,
+        symmetrized_operators,
         ground_state,
     )
     return expectations.real
+
 
 
 def compute_bias_loss(
@@ -415,20 +419,37 @@ def error_hamiltonian_for_batch(
     point_norms_squared = compute_point_norms_squared(feature_batch)
     return assemble_error_hamiltonian(sum_of_squared, linear_contraction, point_norms_squared)
 
+def assemble_core_hamiltonian(
+    sum_of_squared_operators: torch.Tensor,
+    linear_contraction: torch.Tensor,
+) -> torch.Tensor:
+    assembled = sum_of_squared_operators.unsqueeze(0) - linear_contraction
+    return hermitian_part(assembled)
+
+
+def core_hamiltonian_for_batch(
+    feature_batch: torch.Tensor,
+    hermitian_operators: torch.Tensor,
+    sum_of_squared: torch.Tensor,
+) -> torch.Tensor:
+    linear_contraction = compute_linear_operator_contraction(feature_batch, hermitian_operators)
+    return assemble_core_hamiltonian(sum_of_squared, linear_contraction)
 
 def project_batch_to_point_cloud(
     feature_batch: torch.Tensor,
     hermitian_operators: torch.Tensor,
     sum_of_squared: torch.Tensor,
 ) -> dict[str, torch.Tensor]:
-    hamiltonian = error_hamiltonian_for_batch(feature_batch, hermitian_operators, sum_of_squared)
-    ground_eigenvalue, ground_state, excited_eigenvalues, _ = ground_and_excited_eigenpairs(hamiltonian)
+    hamiltonian = core_hamiltonian_for_batch(feature_batch, hermitian_operators, sum_of_squared)
+    ground_eigenvalue_core, ground_state, excited_eigenvalues_core, _ = ground_and_excited_eigenpairs(hamiltonian)
+    point_norms_squared = 0.5 * torch.sum(feature_batch ** 2, dim=-1)
+    ground_eigenvalue = ground_eigenvalue_core + point_norms_squared
     projected_batch = compute_coordinate_expectations(ground_state, hermitian_operators)
     return {
         "projected_batch": projected_batch,
         "ground_state": ground_state,
         "ground_eigenvalue": ground_eigenvalue,
-        "first_eigenvalue_gap": excited_eigenvalues[:, 0] - ground_eigenvalue,
+        "first_eigenvalue_gap": excited_eigenvalues_core[:, 0] - ground_eigenvalue_core,
         "local_variance": compute_local_variance(ground_state, projected_batch, sum_of_squared),
     }
 
@@ -456,19 +477,41 @@ def execute_gradient_step(
     return loss.item()
 
 
+def differentiate_ground_state(
+    hamiltonian: torch.Tensor,
+    ground_state: torch.Tensor,
+    ground_eigenvalue: torch.Tensor,
+    excited_states: torch.Tensor,
+    excited_eigenvalues: torch.Tensor,
+) -> torch.Tensor:
+    transition_elements = torch.einsum(
+        "bnk, bnm, bm -> bk",
+        excited_states.conj(),
+        hamiltonian,
+        ground_state,
+    )
+    energy_gaps = excited_eigenvalues - ground_eigenvalue.unsqueeze(-1)
+    scaled_transitions = transition_elements / energy_gaps
+    perturbation_vector = torch.einsum("bk, bnk -> bn", scaled_transitions, excited_states)
+    return ground_state - perturbation_vector
+
+
 def ground_state_for_batch(
     feature_batch: torch.Tensor,
     hermitian_operators: torch.Tensor,
     sum_of_squared: torch.Tensor,
     detach_eigenvectors: bool,
 ) -> torch.Tensor:
-    hamiltonian = error_hamiltonian_for_batch(feature_batch, hermitian_operators, sum_of_squared)
+    hamiltonian = core_hamiltonian_for_batch(feature_batch, hermitian_operators, sum_of_squared)
+    with torch.no_grad():
+        ground_eigenvalue, ground_state, excited_eigenvalues, excited_states = (
+            ground_and_excited_eigenpairs(hamiltonian)
+        )
     if detach_eigenvectors:
-        with torch.no_grad():
-            _, ground_state = lowest_eigenpair(hamiltonian)
         return ground_state
-    _, ground_state = lowest_eigenpair(hamiltonian)
-    return ground_state
+    return differentiate_ground_state(
+        hamiltonian, ground_state, ground_eigenvalue, excited_states, excited_eigenvalues
+    )
 
 
 def training_step(
@@ -526,7 +569,7 @@ def active_eigenvalues_from_projected_batch(
     hermitian_operators: torch.Tensor,
     sum_of_squared: torch.Tensor,
 ) -> torch.Tensor:
-    hamiltonian = error_hamiltonian_for_batch(projected_batch, hermitian_operators, sum_of_squared)
+    hamiltonian = core_hamiltonian_for_batch(projected_batch, hermitian_operators, sum_of_squared)
     ground_eigenvalue, ground_state, excited_eigenvalues, excited_states = ground_and_excited_eigenpairs(hamiltonian)
     eigenvalue_gaps = compute_eigenvalue_gaps(ground_eigenvalue, excited_eigenvalues)
     raw_transitions = compute_transition_matrix_elements(ground_state, excited_states, hermitian_operators)
@@ -1124,7 +1167,7 @@ def spectrum_and_metric_diagonal(
     hermitian_operators: torch.Tensor,
     sum_of_squared: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    hamiltonian = error_hamiltonian_for_batch(projected_batch, hermitian_operators, sum_of_squared)
+    hamiltonian = core_hamiltonian_for_batch(projected_batch, hermitian_operators, sum_of_squared)
     ground_eigenvalue, ground_state, excited_eigenvalues, excited_states = ground_and_excited_eigenpairs(hamiltonian)
     eigenvalue_gaps = compute_eigenvalue_gaps(ground_eigenvalue, excited_eigenvalues)
     raw_transitions = compute_transition_matrix_elements(ground_state, excited_states, hermitian_operators)
