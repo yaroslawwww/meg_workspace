@@ -1,14 +1,9 @@
 #!/usr/bin/env python3
-"""
-qcml_meg_engine_v3.py
-Движок Quantum Cognition Machine Learning (QCML) для анализа динамических
-многообразий МЭГ (Версия v3).
-"""
 
+import argparse
 import gc
 import math
 import time
-import argparse
 from pathlib import Path
 from typing import Generator
 
@@ -17,83 +12,28 @@ import mne
 import torch
 import pyarrow as pa
 import pyarrow.parquet as pq
-
-from functools import lru_cache, partial
-from scipy.integrate import quad
-from scipy.optimize import brentq
+import scipy.linalg
 
 mne.set_log_level("ERROR")
 
 
 MILLISECONDS_PER_SECOND = 1000.0
 MINIMUM_TAKENS_LAG_SAMPLES = 1
-EIGENVALUE_ZERO_TOLERANCE_MULTIPLIER = 10.0
 DIMENSION_THRESHOLD = 0.5
-RMT_BULK_FRACTION = 0.25
-
-
-def marchenko_pastur_eigenvalue_support(aspect_ratio: float) -> tuple[float, float]:
-    sqrt_aspect_ratio = math.sqrt(aspect_ratio)
-    lower_edge = (1.0 - sqrt_aspect_ratio) ** 2
-    upper_edge = (1.0 + sqrt_aspect_ratio) ** 2
-    return lower_edge, upper_edge
-
-
-def marchenko_pastur_eigenvalue_density(eigenvalue: float, aspect_ratio: float) -> float:
-    lower_edge, upper_edge = marchenko_pastur_eigenvalue_support(aspect_ratio)
-    bulk_product = (upper_edge - eigenvalue) * (eigenvalue - lower_edge)
-    bulk_amplitude = math.sqrt(max(bulk_product, 0.0))
-    normalization = 2.0 * math.pi * aspect_ratio * eigenvalue
-    return bulk_amplitude / normalization
-
-
-def marchenko_pastur_cumulative_probability(eigenvalue: float, aspect_ratio: float) -> float:
-    lower_edge, _ = marchenko_pastur_eigenvalue_support(aspect_ratio)
-    integral_value, _ = quad(
-        marchenko_pastur_eigenvalue_density, lower_edge, eigenvalue, args=(aspect_ratio,)
-    )
-    return integral_value
-
-
-def marchenko_pastur_median_deviation(eigenvalue: float, aspect_ratio: float) -> float:
-    cumulative_probability = marchenko_pastur_cumulative_probability(eigenvalue, aspect_ratio)
-    return cumulative_probability - 0.5
-
-
-@lru_cache(maxsize=128)
-def marchenko_pastur_median(aspect_ratio: float) -> float:
-    lower_edge, upper_edge = marchenko_pastur_eigenvalue_support(aspect_ratio)
-    median_deviation = partial(marchenko_pastur_median_deviation, aspect_ratio=aspect_ratio)
-    return brentq(median_deviation, lower_edge, upper_edge)
-
-
-def least_favorable_amplitude_squared(aspect_ratio: float) -> float:
-    shifted_aspect_ratio = aspect_ratio + 1.0
-    quartic_beta_coefficient = 3.0
-    discriminant = shifted_aspect_ratio ** 2 + 4.0 * quartic_beta_coefficient * aspect_ratio
-    return (shifted_aspect_ratio + math.sqrt(discriminant)) / 2.0
-
-
-def gavish_donoho_squared_coefficient(aspect_ratio: float) -> float:
-    amplitude_squared = least_favorable_amplitude_squared(aspect_ratio)
-    shifted_aspect_ratio = aspect_ratio + 1.0
-    aspect_ratio_over_amplitude_squared = aspect_ratio / amplitude_squared
-    return amplitude_squared + shifted_aspect_ratio + aspect_ratio_over_amplitude_squared
-
-
-def gavish_donoho_coefficient(aspect_ratio: float) -> float:
-    return math.sqrt(gavish_donoho_squared_coefficient(aspect_ratio))
-
-
-@lru_cache(maxsize=128)
-def unknown_noise_threshold_coefficient(aspect_ratio: float) -> float:
-    median_under_null = marchenko_pastur_median(aspect_ratio)
-    known_noise_coefficient = gavish_donoho_coefficient(aspect_ratio)
-    return known_noise_coefficient / math.sqrt(median_under_null)
+# этот параметр взял с потолка, но он логичен. если DIMENSION_THRESHOLD = 0.5, то 0.01 точно меньше.
+EIGENVALUE_NOISE_FLOOR = 1e-2
+# лан, пусть так будет
 
 
 def load_preprocessed_raw_fif(fif_path: Path) -> mne.io.Raw:
     return mne.io.read_raw_fif(fif_path, preload=True, verbose=False)
+
+
+def load_synthetic_features(npz_path: Path) -> np.ndarray:
+    payload = np.load(npz_path)
+    features = np.asarray(payload["features"], dtype=np.float64)
+    print(f"  [Синтетика] Загружено {features.shape[0]} сэмплов размерности {features.shape[1]}")
+    return features
 
 
 def meg_sampling_frequency(recording: mne.io.Raw) -> float:
@@ -101,24 +41,27 @@ def meg_sampling_frequency(recording: mne.io.Raw) -> float:
 
 
 def magnetometer_channel_indices(recording: mne.io.Raw) -> list[int]:
-    indices = mne.pick_types(
+    return mne.pick_types(
         recording.info, meg="mag", eeg=False, stim=False, eog=False, ecg=False
-    )
-    return indices.tolist()
+    ).tolist()
 
 
 def gradiometer_channel_indices(recording: mne.io.Raw) -> list[int]:
-    indices = mne.pick_types(
+    return mne.pick_types(
         recording.info, meg="grad", eeg=False, stim=False, eog=False, ecg=False
-    )
-    return indices.tolist()
+    ).tolist()
 
 
 def extract_meg_samples(
     recording: mne.io.Raw,
     selected_channel_indices: np.ndarray,
 ) -> np.ndarray:
-    return recording.get_data(picks=selected_channel_indices).T.astype(np.float64)
+    samples = recording.get_data(picks=selected_channel_indices).T.astype(np.float64)
+    # Заменяем возможные краевые NaN/Inf на нули, чтобы исключить порчу валидационных батчей, если в этом проблема
+    nan_mask = ~np.isfinite(samples)
+    if np.any(nan_mask):
+        samples[nan_mask] = 0.0
+    return samples
 
 
 def remove_sensor_offsets(samples: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -203,17 +146,17 @@ def hermitian_part(matrix: torch.Tensor) -> torch.Tensor:
     return 0.5 * (matrix + matrix.conj().transpose(-1, -2))
 
 
-def operator_initialization_scale(feature_dimension: int, hilbert_dimension: int) -> float:
-    return 1.0 / math.sqrt(feature_dimension * hilbert_dimension)
+def operator_initialization_scale(hilbert_dimension: int) -> float:
+    return 1.0 / math.sqrt(hilbert_dimension)
 
 
 def initialize_operator_parameters(
     feature_dimension: int, hilbert_dimension: int, device: torch.device
 ) -> torch.Tensor:
-    initialization_scale = operator_initialization_scale(feature_dimension, hilbert_dimension)
+    scale = operator_initialization_scale(hilbert_dimension)
     real_part = torch.randn(feature_dimension, hilbert_dimension, hilbert_dimension, device=device)
     imaginary_part = torch.randn(feature_dimension, hilbert_dimension, hilbert_dimension, device=device)
-    raw_operators = torch.complex(real_part * initialization_scale, imaginary_part * initialization_scale)
+    raw_operators = torch.complex(real_part * scale, imaginary_part * scale)
     raw_operators.requires_grad_(True)
     return raw_operators
 
@@ -250,18 +193,102 @@ def assemble_error_hamiltonian(
     assembled = sum_of_squared_operators.unsqueeze(0) - linear_contraction + point_term
     return hermitian_part(assembled)
 
+
+def compute_linear_operator_contraction(
+    feature_batch: torch.Tensor,
+    hermitian_operators: torch.Tensor,
+) -> torch.Tensor:
+    complex_feature_batch = feature_batch.to(torch.complex64)
+    return torch.einsum("bd, dnm -> bnm", complex_feature_batch, hermitian_operators)
+
+
+def compute_point_norms_squared(feature_batch: torch.Tensor) -> torch.Tensor:
+    squared_norms = torch.sum(feature_batch ** 2, dim=-1, keepdim=True)
+    return 0.5 * squared_norms.unsqueeze(-1)
+
+
+def assemble_core_hamiltonian(
+    sum_of_squared_operators: torch.Tensor,
+    linear_contraction: torch.Tensor,
+) -> torch.Tensor:
+    assembled = sum_of_squared_operators.unsqueeze(0) - linear_contraction
+    return hermitian_part(assembled)
+
+
+def core_hamiltonian_for_batch(
+    feature_batch: torch.Tensor,
+    hermitian_operators: torch.Tensor,
+    sum_of_squared: torch.Tensor,
+) -> torch.Tensor:
+    linear_contraction = compute_linear_operator_contraction(feature_batch, hermitian_operators)
+    return assemble_core_hamiltonian(sum_of_squared, linear_contraction)
+
+
+def apply_scale_invariant_jitter(centered_matrix: torch.Tensor) -> torch.Tensor:
+    hilbert_dimension = centered_matrix.shape[-1]
+    eps_single = torch.finfo(torch.float32).eps
+    frobenius_norm = torch.linalg.matrix_norm(
+        centered_matrix, ord="fro", dim=(-2, -1), keepdim=True
+    )
+    scale = frobenius_norm / float(hilbert_dimension)
+    zero_centered_grid = (
+        torch.arange(hilbert_dimension, device=centered_matrix.device, dtype=torch.float64)
+        - (hilbert_dimension - 1) / 2.0
+    )
+    diagonal_perturbation = (
+        zero_centered_grid.view(1, 1, -1) * (eps_single * scale)
+    ).to(centered_matrix.dtype)
+    return centered_matrix + torch.diag_embed(diagonal_perturbation.squeeze(1))
+
+
+def solve_eigh_scipy_qr(centered_matrix: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    matrix_numpy = centered_matrix.detach().cpu().numpy()
+    batch_size = matrix_numpy.shape[0]
+    eigenvalue_list = []
+    eigenvector_list = []
+    for batch_index in range(batch_size):
+        values, vectors = scipy.linalg.eigh(matrix_numpy[batch_index], driver="ev")
+        eigenvalue_list.append(values)
+        eigenvector_list.append(vectors)
+    eigenvalues = torch.from_numpy(np.stack(eigenvalue_list)).to(
+        device=centered_matrix.device, dtype=torch.float64
+    )
+    eigenvectors = torch.from_numpy(np.stack(eigenvector_list)).to(
+        device=centered_matrix.device, dtype=centered_matrix.dtype
+    )
+    return eigenvalues, eigenvectors
+
+
+def eigh_with_trace_shift(matrix: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    hilbert_dimension = matrix.shape[-1]
+    trace_mean = torch.diagonal(matrix, dim1=-2, dim2=-1).sum(dim=-1).real / float(hilbert_dimension)
+    identity = torch.eye(hilbert_dimension, device=matrix.device, dtype=matrix.dtype)
+    centered_matrix = matrix - trace_mean.unsqueeze(-1).unsqueeze(-1) * identity
+    # Есть вероятность плохой обусловленности, пришлось фиксить(
+    try:
+        centered_eigenvalues, eigenvectors = torch.linalg.eigh(centered_matrix)
+    except (torch.linalg.LinAlgError, RuntimeError):
+        perturbed_matrix = apply_scale_invariant_jitter(centered_matrix)
+        try:
+            centered_eigenvalues, eigenvectors = torch.linalg.eigh(perturbed_matrix)
+        except (torch.linalg.LinAlgError, RuntimeError):
+            centered_eigenvalues, eigenvectors = solve_eigh_scipy_qr(centered_matrix)
+
+    # Проверка на корректность нормы: исключает разлёт вектора состояния, если что-то сломается в расходимости потом.
+    vector_norms = torch.linalg.vector_norm(eigenvectors, dim=-2, keepdim=True)
+    epsilon_machine = torch.finfo(eigenvectors.real.dtype).eps
+    minimum_norm = math.sqrt(hilbert_dimension) * epsilon_machine
+    eigenvectors = eigenvectors / torch.clamp(vector_norms, min=minimum_norm)
+
+    eigenvalues = centered_eigenvalues + trace_mean.unsqueeze(-1)
+    return eigenvalues, eigenvectors
+
+
+
 def complex_eigh(hamiltonian: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    matrix = hermitian_part(hamiltonian)
-    if not torch.is_grad_enabled():
-        eigenvalues, eigenvectors = torch.linalg.eigh(matrix.to(torch.complex128))
-        return eigenvalues.to(torch.float32), eigenvectors.to(torch.complex64)
-    return torch.linalg.eigh(matrix)
-
-
-
-def lowest_eigenpair(hamiltonian: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    eigenvalues, eigenvectors = complex_eigh(hamiltonian)
-    return eigenvalues[:, 0].to(torch.float32), eigenvectors[:, :, 0].to(torch.complex64)
+    matrix = hermitian_part(hamiltonian).to(torch.complex128)
+    eigenvalues, eigenvectors = eigh_with_trace_shift(matrix)
+    return eigenvalues.to(torch.float32), eigenvectors.to(torch.complex64)
 
 
 def ground_and_excited_eigenpairs(
@@ -275,17 +302,99 @@ def ground_and_excited_eigenpairs(
     return ground_eigenvalue, ground_state, excited_eigenvalues, excited_states
 
 
-def compute_linear_operator_contraction(
+class HermitianGroundStateFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, hamiltonian: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        with torch.no_grad():
+            matrix = hermitian_part(hamiltonian).to(torch.complex128)
+            eigenvalues, eigenvectors = eigh_with_trace_shift(matrix)
+            spectral_range = eigenvalues[:, -1] - eigenvalues[:, 0]
+            hilbert_dimension = eigenvalues.shape[-1]
+            eta = spectral_range / float(hilbert_dimension * hilbert_dimension)
+
+        ground_eigenvalue = eigenvalues[:, 0].to(torch.float32).contiguous()
+        ground_state = eigenvectors[:, :, 0].to(torch.complex64).contiguous()
+        excited_eigenvalues = eigenvalues[:, 1:].to(torch.float32).contiguous()
+        excited_states = eigenvectors[:, :, 1:].to(torch.complex64).contiguous()
+        eta_tensor = eta.to(torch.float32).contiguous()
+
+        ctx.save_for_backward(
+            ground_state, ground_eigenvalue, excited_states, excited_eigenvalues, eta_tensor
+        )
+        return ground_eigenvalue, ground_state
+
+    @staticmethod
+    def backward(
+        ctx,
+        grad_ground_eigenvalue: torch.Tensor | None,
+        grad_ground_state: torch.Tensor | None,
+    ) -> torch.Tensor:
+        ground_state, ground_eigenvalue, excited_states, excited_eigenvalues, eta = (
+            ctx.saved_tensors
+        )
+        batch_size, hilbert_dimension = ground_state.shape
+        gradient_hamiltonian = torch.zeros(
+            batch_size, hilbert_dimension, hilbert_dimension,
+            dtype=torch.complex64, device=ground_state.device,
+        )
+
+        if grad_ground_eigenvalue is not None:
+            outer_ground = (
+                ground_state.unsqueeze(-1) * ground_state.conj().unsqueeze(-2)
+            )
+            gradient_hamiltonian = (
+                gradient_hamiltonian
+                + grad_ground_eigenvalue.view(-1, 1, 1) * outer_ground
+            )
+
+        if grad_ground_state is not None:
+            overlap = (ground_state.conj() * grad_ground_state).sum(dim=-1, keepdim=True)
+            gradient_perpendicular = grad_ground_state - overlap * ground_state
+
+            transition_coefficients = torch.einsum(
+                "bnk,bn->bk", excited_states.conj(), gradient_perpendicular
+            )
+
+            energy_gaps = excited_eigenvalues - ground_eigenvalue.unsqueeze(-1)
+            resolvent = energy_gaps / (energy_gaps * energy_gaps + eta.unsqueeze(-1) ** 2)
+
+            conjugate_state = torch.einsum(
+                "bk,bk,bnk->bn",
+                transition_coefficients,
+                resolvent,
+                excited_states,
+            )
+
+            outer_conjugate_ground = (
+                conjugate_state.unsqueeze(-1) * ground_state.conj().unsqueeze(-2)
+            )
+            outer_ground_conjugate = (
+                ground_state.unsqueeze(-1) * conjugate_state.conj().unsqueeze(-2)
+            )
+            gradient_hamiltonian = gradient_hamiltonian - 0.5 * (
+                outer_conjugate_ground + outer_ground_conjugate
+            )
+
+        return hermitian_part(gradient_hamiltonian)
+
+
+def ground_state_with_gradient(hamiltonian: torch.Tensor) -> torch.Tensor:
+    _, ground_state = HermitianGroundStateFunction.apply(hamiltonian)
+    return ground_state
+
+
+def ground_state_for_batch(
     feature_batch: torch.Tensor,
     hermitian_operators: torch.Tensor,
+    sum_of_squared: torch.Tensor,
+    detach_eigenvectors: bool,
 ) -> torch.Tensor:
-    complex_feature_batch = feature_batch.to(torch.complex64)
-    return torch.einsum("bd, dnm -> bnm", complex_feature_batch, hermitian_operators)
-
-
-def compute_point_norms_squared(feature_batch: torch.Tensor) -> torch.Tensor:
-    squared_norms = torch.sum(feature_batch ** 2, dim=-1, keepdim=True)
-    return 0.5 * squared_norms.unsqueeze(-1)
+    hamiltonian = core_hamiltonian_for_batch(feature_batch, hermitian_operators, sum_of_squared)
+    if detach_eigenvectors:
+        with torch.no_grad():
+            _, ground_state, _, _ = ground_and_excited_eigenpairs(hamiltonian)
+        return ground_state
+    return ground_state_with_gradient(hamiltonian)
 
 
 def compute_coordinate_expectations(
@@ -302,13 +411,13 @@ def compute_coordinate_expectations(
     return expectations.real
 
 
-
 def compute_bias_loss(
     feature_batch: torch.Tensor,
     projected_batch: torch.Tensor,
 ) -> torch.Tensor:
+    feature_dimension = feature_batch.shape[-1]
     squared_errors = torch.sum((projected_batch - feature_batch) ** 2, dim=-1)
-    return torch.mean(squared_errors)
+    return torch.mean(squared_errors) / feature_dimension
 
 
 def compute_local_variance(
@@ -331,6 +440,17 @@ def compute_projection_residuals(
     projected_batch: torch.Tensor,
 ) -> torch.Tensor:
     return torch.linalg.norm(projected_batch - feature_batch, dim=-1)
+
+
+def compute_qcml_composite_loss(
+    bias_loss: torch.Tensor,
+    variance_batch: torch.Tensor | None,
+    variance_weight: float,
+    feature_dimension: int,
+) -> torch.Tensor:
+    if variance_batch is None:
+        return bias_loss
+    return bias_loss + (variance_weight / feature_dimension) * torch.mean(variance_batch)
 
 
 def compute_eigenvalue_gaps(
@@ -376,34 +496,35 @@ def compute_analytic_metric_diagonal(
 
 def active_eigenvalues_from_transition_features(
     transition_features: torch.Tensor,
+    gramian_dimension: int,
 ) -> torch.Tensor:
     singular_values = torch.linalg.svdvals(transition_features.to(torch.float64))
-    return (singular_values ** 2).to(torch.float32)
+    eigenvalues = (singular_values ** 2).to(torch.float32)
+    if eigenvalues.shape[-1] < gramian_dimension:
+        padding_size = gramian_dimension - eigenvalues.shape[-1]
+        padding = torch.zeros(
+            eigenvalues.shape[0], padding_size,
+            device=eigenvalues.device, dtype=eigenvalues.dtype,
+        )
+        eigenvalues = torch.cat([eigenvalues, padding], dim=-1)
+    return eigenvalues
 
 
 def compute_ratio_gap_dimension(active_eigenvalues: torch.Tensor) -> torch.Tensor:
-    tensor_epsilon = torch.finfo(active_eigenvalues.dtype).eps
-    consecutive_ratios = active_eigenvalues[:, :-1] / (active_eigenvalues[:, 1:] + tensor_epsilon)
-    ratio_gap = (torch.argmax(consecutive_ratios, dim=1) + 1).to(torch.float32)
-    zero_tolerance = EIGENVALUE_ZERO_TOLERANCE_MULTIPLIER * tensor_epsilon
-    return torch.where(
-        active_eigenvalues[:, 0] > zero_tolerance,
-        ratio_gap,
-        torch.zeros_like(ratio_gap),
+    masked = torch.where(
+        active_eigenvalues > EIGENVALUE_NOISE_FLOOR,
+        active_eigenvalues,
+        torch.zeros_like(active_eigenvalues),
     )
-
-
-def compute_rmt_dimension(
-    active_eigenvalues: torch.Tensor,
-    unknown_noise_threshold: float,
-) -> torch.Tensor:
-    singular_values = torch.sqrt(torch.clamp(active_eigenvalues, min=0.0))
-    gramian_dimension = singular_values.shape[1]
-    bulk_start = int(RMT_BULK_FRACTION * gramian_dimension)
-    bulk_slice = singular_values[:, bulk_start:]
-    median_singular_value = torch.median(bulk_slice, dim=-1).values
-    threshold = unknown_noise_threshold * median_singular_value
-    return (singular_values > threshold.unsqueeze(-1)).sum(dim=-1).to(torch.float32)
+    numerator = masked[:, :-1]
+    denominator = torch.where(
+        masked[:, 1:] > 0.0,
+        masked[:, 1:],
+        torch.full_like(masked[:, 1:], EIGENVALUE_NOISE_FLOOR),
+    )
+    ratios = numerator / denominator
+    ratio_gap = (torch.argmax(ratios, dim=1) + 1).to(torch.float32)
+    return ratio_gap
 
 
 def compute_threshold_dimension(active_eigenvalues: torch.Tensor) -> torch.Tensor:
@@ -419,21 +540,6 @@ def error_hamiltonian_for_batch(
     point_norms_squared = compute_point_norms_squared(feature_batch)
     return assemble_error_hamiltonian(sum_of_squared, linear_contraction, point_norms_squared)
 
-def assemble_core_hamiltonian(
-    sum_of_squared_operators: torch.Tensor,
-    linear_contraction: torch.Tensor,
-) -> torch.Tensor:
-    assembled = sum_of_squared_operators.unsqueeze(0) - linear_contraction
-    return hermitian_part(assembled)
-
-
-def core_hamiltonian_for_batch(
-    feature_batch: torch.Tensor,
-    hermitian_operators: torch.Tensor,
-    sum_of_squared: torch.Tensor,
-) -> torch.Tensor:
-    linear_contraction = compute_linear_operator_contraction(feature_batch, hermitian_operators)
-    return assemble_core_hamiltonian(sum_of_squared, linear_contraction)
 
 def project_batch_to_point_cloud(
     feature_batch: torch.Tensor,
@@ -454,14 +560,25 @@ def project_batch_to_point_cloud(
     }
 
 
-def compute_qcml_composite_loss(
-    bias_loss: torch.Tensor,
-    variance_batch: torch.Tensor | None,
-    variance_weight: float,
-) -> torch.Tensor:
-    if variance_batch is None:
-        return bias_loss
-    return bias_loss + variance_weight * torch.mean(variance_batch)
+def spectrum_and_metric_diagonal(
+    projected_batch: torch.Tensor,
+    hermitian_operators: torch.Tensor,
+    sum_of_squared: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    hilbert_dimension = hermitian_operators.shape[-1]
+    gramian_dimension = 2 * (hilbert_dimension - 1)
+    hamiltonian = core_hamiltonian_for_batch(projected_batch, hermitian_operators, sum_of_squared)
+    ground_eigenvalue, ground_state, excited_eigenvalues, excited_states = ground_and_excited_eigenpairs(hamiltonian)
+    eigenvalue_gaps = compute_eigenvalue_gaps(ground_eigenvalue, excited_eigenvalues)
+    raw_transitions = compute_transition_matrix_elements(ground_state, excited_states, hermitian_operators)
+    scaled_transitions = scale_transition_vectors_by_gap(raw_transitions, eigenvalue_gaps)
+    transition_features = assemble_transition_feature_matrix(scaled_transitions)
+    metric_diagonal = compute_analytic_metric_diagonal(transition_features)
+    metric_traces = torch.sum(metric_diagonal, dim=-1)
+    active_eigenvalues = active_eigenvalues_from_transition_features(
+        transition_features, gramian_dimension
+    )
+    return active_eigenvalues, metric_diagonal, metric_traces
 
 
 def execute_gradient_step(
@@ -475,43 +592,6 @@ def execute_gradient_step(
     torch.nn.utils.clip_grad_norm_([raw_operators], max_norm=grad_clip_norm)
     optimizer.step()
     return loss.item()
-
-
-def differentiate_ground_state(
-    hamiltonian: torch.Tensor,
-    ground_state: torch.Tensor,
-    ground_eigenvalue: torch.Tensor,
-    excited_states: torch.Tensor,
-    excited_eigenvalues: torch.Tensor,
-) -> torch.Tensor:
-    transition_elements = torch.einsum(
-        "bnk, bnm, bm -> bk",
-        excited_states.conj(),
-        hamiltonian,
-        ground_state,
-    )
-    energy_gaps = excited_eigenvalues - ground_eigenvalue.unsqueeze(-1)
-    scaled_transitions = transition_elements / energy_gaps
-    perturbation_vector = torch.einsum("bk, bnk -> bn", scaled_transitions, excited_states)
-    return ground_state - perturbation_vector
-
-
-def ground_state_for_batch(
-    feature_batch: torch.Tensor,
-    hermitian_operators: torch.Tensor,
-    sum_of_squared: torch.Tensor,
-    detach_eigenvectors: bool,
-) -> torch.Tensor:
-    hamiltonian = core_hamiltonian_for_batch(feature_batch, hermitian_operators, sum_of_squared)
-    with torch.no_grad():
-        ground_eigenvalue, ground_state, excited_eigenvalues, excited_states = (
-            ground_and_excited_eigenpairs(hamiltonian)
-        )
-    if detach_eigenvectors:
-        return ground_state
-    return differentiate_ground_state(
-        hamiltonian, ground_state, ground_eigenvalue, excited_states, excited_eigenvalues
-    )
 
 
 def training_step(
@@ -528,11 +608,14 @@ def training_step(
     )
     projected_batch = compute_coordinate_expectations(ground_state, hermitian_operators)
     bias_loss = compute_bias_loss(feature_batch, projected_batch)
+    feature_dimension = feature_batch.shape[-1]
     if variance_weight == 0.0:
         variance_batch = None
     else:
         variance_batch = compute_local_variance(ground_state, projected_batch, sum_of_squared)
-    loss = compute_qcml_composite_loss(bias_loss, variance_batch, variance_weight)
+    loss = compute_qcml_composite_loss(
+        bias_loss, variance_batch, variance_weight, feature_dimension
+    )
     return execute_gradient_step(optimizer, loss, raw_operators, grad_clip_norm)
 
 
@@ -561,70 +644,59 @@ def run_training_epoch(
             grad_clip_norm,
         )
         processed_batch_count += 1
-    return accumulated_loss / max(processed_batch_count, 1)
-
-
-def active_eigenvalues_from_projected_batch(
-    projected_batch: torch.Tensor,
-    hermitian_operators: torch.Tensor,
-    sum_of_squared: torch.Tensor,
-) -> torch.Tensor:
-    hamiltonian = core_hamiltonian_for_batch(projected_batch, hermitian_operators, sum_of_squared)
-    ground_eigenvalue, ground_state, excited_eigenvalues, excited_states = ground_and_excited_eigenpairs(hamiltonian)
-    eigenvalue_gaps = compute_eigenvalue_gaps(ground_eigenvalue, excited_eigenvalues)
-    raw_transitions = compute_transition_matrix_elements(ground_state, excited_states, hermitian_operators)
-    scaled_transitions = scale_transition_vectors_by_gap(raw_transitions, eigenvalue_gaps)
-    transition_features = assemble_transition_feature_matrix(scaled_transitions)
-    return active_eigenvalues_from_transition_features(transition_features)
+    return accumulated_loss / processed_batch_count
 
 
 def validation_batch_metrics(
     feature_batch: torch.Tensor,
     hermitian_operators: torch.Tensor,
     sum_of_squared: torch.Tensor,
-    unknown_noise_threshold: float,
     variance_weight: float,
-) -> tuple[float, float, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[float, float, torch.Tensor, torch.Tensor, torch.Tensor]:
     projection = project_batch_to_point_cloud(
         feature_batch, hermitian_operators, sum_of_squared
     )
     projected_batch = projection["projected_batch"]
     ground_state = projection["ground_state"]
 
-    bias_sum = torch.sum((projected_batch - feature_batch) ** 2, dim=-1).sum().item()
+    squared_errors = torch.sum((projected_batch - feature_batch) ** 2, dim=-1)
+    # Исключаем единичные нефизичные бесконечности/NaN в отложенной выборке, если вдруг они там будут.
+    valid_mask = torch.isfinite(squared_errors)
+    if torch.any(valid_mask):
+        bias_sum = squared_errors[valid_mask].sum().item()
+    else:
+        bias_sum = 0.0
+
     if variance_weight == 0.0:
         variance_sum = 0.0
     else:
-        variance_sum = compute_local_variance(
-            ground_state, projected_batch, sum_of_squared
-        ).sum().item()
-    active_eigenvalues = active_eigenvalues_from_projected_batch(
+        variance = compute_local_variance(ground_state, projected_batch, sum_of_squared)
+        variance_valid = torch.isfinite(variance)
+        variance_sum = variance[variance_valid].sum().item() if torch.any(variance_valid) else 0.0
+
+    active_eigenvalues, _, _ = spectrum_and_metric_diagonal(
         projected_batch, hermitian_operators, sum_of_squared
     )
     ratio_gap = compute_ratio_gap_dimension(active_eigenvalues)
-    rmt_dimension = compute_rmt_dimension(active_eigenvalues, unknown_noise_threshold)
     threshold_dimension = compute_threshold_dimension(active_eigenvalues)
-    return bias_sum, variance_sum, ratio_gap, rmt_dimension, threshold_dimension, active_eigenvalues
-
+    return bias_sum, variance_sum, ratio_gap, threshold_dimension, active_eigenvalues
 
 def validation_statistics(
     accumulated_bias: float,
     accumulated_variance: float,
     ratio_gaps: torch.Tensor,
-    rmt_dimensions: torch.Tensor,
     threshold_dimensions: torch.Tensor,
     processed_sample_count: int,
     variance_weight: float,
+    feature_dimension: int,
 ) -> dict[str, float]:
-    bias_mean = accumulated_bias / max(processed_sample_count, 1)
-    variance_mean = accumulated_variance / max(processed_sample_count, 1)
+    bias_mean = accumulated_bias / processed_sample_count / feature_dimension
+    variance_mean = accumulated_variance / processed_sample_count
     return {
-        "val_loss": bias_mean + variance_weight * variance_mean,
+        "val_loss": bias_mean + (variance_weight / feature_dimension) * variance_mean,
         "val_bias": bias_mean,
         "d_ratio_mean": ratio_gaps.mean().item(),
         "d_ratio_std": ratio_gaps.std(unbiased=True).item() if ratio_gaps.numel() > 1 else 0.0,
-        "d_rmt_mean": rmt_dimensions.mean().item(),
-        "d_rmt_std": rmt_dimensions.std(unbiased=True).item() if rmt_dimensions.numel() > 1 else 0.0,
         "d_th_mean": threshold_dimensions.mean().item(),
         "d_th_std": threshold_dimensions.std(unbiased=True).item() if threshold_dimensions.numel() > 1 else 0.0,
     }
@@ -651,36 +723,33 @@ def print_spectrum_diagnostic(active_eigenvalues: torch.Tensor) -> None:
 def evaluate_validation(
     validation_samples: np.ndarray,
     raw_operators: torch.Tensor,
-    unknown_noise_threshold: float,
     batch_size: int,
     device: torch.device,
     variance_weight: float,
     print_spectrum: bool,
 ) -> dict[str, float]:
     hermitian_operators, sum_of_squared = build_hermitian_and_squared_operators(raw_operators)
+    feature_dimension = validation_samples.shape[-1]
     accumulated_bias = 0.0
     accumulated_variance = 0.0
     ratio_gap_chunks: list[torch.Tensor] = []
-    rmt_dimension_chunks: list[torch.Tensor] = []
     threshold_dimension_chunks: list[torch.Tensor] = []
     processed_sample_count = 0
     first_batch_eigenvalues: torch.Tensor | None = None
     for batch_start in range(0, validation_samples.shape[0], batch_size):
         batch_end = min(batch_start + batch_size, validation_samples.shape[0])
         feature_batch = torch.from_numpy(validation_samples[batch_start:batch_end]).to(device)
-        bias_sum, variance_sum, ratio_gap, rmt_dimension, threshold_dimension, active_eigenvalues = (
+        bias_sum, variance_sum, ratio_gap, threshold_dimension, active_eigenvalues = (
             validation_batch_metrics(
                 feature_batch,
                 hermitian_operators,
                 sum_of_squared,
-                unknown_noise_threshold,
                 variance_weight,
             )
         )
         accumulated_bias += bias_sum
         accumulated_variance += variance_sum
         ratio_gap_chunks.append(ratio_gap.cpu())
-        rmt_dimension_chunks.append(rmt_dimension.cpu())
         threshold_dimension_chunks.append(threshold_dimension.cpu())
         processed_sample_count += feature_batch.shape[0]
         if first_batch_eigenvalues is None:
@@ -693,10 +762,10 @@ def evaluate_validation(
         accumulated_bias,
         accumulated_variance,
         torch.cat(ratio_gap_chunks),
-        torch.cat(rmt_dimension_chunks),
         torch.cat(threshold_dimension_chunks),
         processed_sample_count,
         variance_weight,
+        feature_dimension,
     )
 
 
@@ -728,9 +797,21 @@ def print_split_statistics(
     )
 
 
-def gramian_aspect_ratio(hilbert_dimension: int, feature_dimension: int) -> float:
-    gramian_dimension = 2 * (hilbert_dimension - 1)
-    return min(1.0, gramian_dimension / float(feature_dimension))
+def resolve_epoch_count(
+    requested_epochs: int,
+    target_steps: int | None,
+    batch_size: int,
+    training_sample_count: int,
+) -> int:
+    if target_steps is None:
+        return requested_epochs
+    batches_per_epoch = max(1, math.ceil(training_sample_count / batch_size))
+    required_epochs = max(1, math.ceil(target_steps / batches_per_epoch))
+    print(
+        f"[*] Бюджет шагов: target_steps = {target_steps} | "
+        f"батчей в эпохе = {batches_per_epoch} -> число эпох = {required_epochs}"
+    )
+    return required_epochs
 
 
 def print_optimization_start(
@@ -738,7 +819,6 @@ def print_optimization_start(
     batch_size: int,
     learning_rate: float,
     variance_weight: float,
-    unknown_noise_threshold: float,
     detach_eigenvectors: bool,
     hilbert_dimension: int,
     feature_dimension: int,
@@ -747,7 +827,7 @@ def print_optimization_start(
     print(
         f"[*] QCML v3 | D={feature_dimension}, N={hilbert_dimension}, "
         f"{n_epochs} эпох, батч={batch_size}, LR={learning_rate}, "
-        f"w={variance_weight}, {gradient_tag}, omega={unknown_noise_threshold:.4f}"
+        f"w={variance_weight}, {gradient_tag}"
     )
 
 
@@ -760,11 +840,10 @@ def print_epoch_statistics(
 ) -> None:
     print(
         f"    Эпоха [{epoch_index + 1:02d}/{n_epochs:02d}] | "
-        f"Train: {train_loss:9.4f} | "
-        f"Val: {statistics['val_loss']:9.4f} "
-        f"(bias {statistics['val_bias']:9.4f}) | "
+        f"Train: {train_loss:9.6f} | "
+        f"Val: {statistics['val_loss']:9.6f} "
+        f"(bias {statistics['val_bias']:9.6f}) | "
         f"d_rg: {statistics['d_ratio_mean']:5.2f}±{statistics['d_ratio_std']:.2f} | "
-        f"d_rmt: {statistics['d_rmt_mean']:5.2f}±{statistics['d_rmt_std']:.2f} | "
         f"d_th: {statistics['d_th_mean']:5.2f}±{statistics['d_th_std']:.2f} | "
         f"{elapsed_seconds:5.1f}s"
     )
@@ -778,8 +857,6 @@ def empty_training_history() -> dict:
         "val_bias": [],
         "d_ratio_mean": [],
         "d_ratio_std": [],
-        "d_rmt_mean": [],
-        "d_rmt_std": [],
         "d_th_mean": [],
         "d_th_std": [],
         "elapsed_seconds": [],
@@ -799,27 +876,24 @@ def append_training_history_entry(
     history["val_bias"].append(float(statistics["val_bias"]))
     history["d_ratio_mean"].append(float(statistics["d_ratio_mean"]))
     history["d_ratio_std"].append(float(statistics["d_ratio_std"]))
-    history["d_rmt_mean"].append(float(statistics["d_rmt_mean"]))
-    history["d_rmt_std"].append(float(statistics["d_rmt_std"]))
     history["d_th_mean"].append(float(statistics["d_th_mean"]))
     history["d_th_std"].append(float(statistics["d_th_std"]))
     history["elapsed_seconds"].append(float(elapsed_seconds))
 
 
 def run_training_and_validation_epoch(
-    training_samples: np.ndarray,
-    validation_samples: np.ndarray,
-    raw_operators: torch.Tensor,
-    optimizer: torch.optim.Optimizer,
-    batch_size: int,
-    device: torch.device,
-    detach_eigenvectors: bool,
-    variance_weight: float,
-    grad_clip_norm: float,
-    unknown_noise_threshold: float,
-    epoch_index: int,
-    n_epochs: int,
-    history: dict,
+        training_samples: np.ndarray,
+        validation_samples: np.ndarray,
+        raw_operators: torch.Tensor,
+        optimizer: torch.optim.Optimizer,
+        batch_size: int,
+        device: torch.device,
+        detach_eigenvectors: bool,
+        variance_weight: float,
+        grad_clip_norm: float,
+        epoch_index: int,
+        n_epochs: int,
+        history: dict,
 ) -> dict[str, float]:
     start_time = time.perf_counter()
     train_loss = run_training_epoch(
@@ -832,17 +906,38 @@ def run_training_and_validation_epoch(
         variance_weight,
         grad_clip_norm,
     )
-    statistics = evaluate_validation(
-        validation_samples,
-        raw_operators,
-        unknown_noise_threshold,
-        batch_size,
-        device,
-        variance_weight,
-        print_spectrum=True,
-    )
+
+    validation_interval = max(1, n_epochs // 20)
+    is_evaluation_epoch = ((epoch_index + 1) % validation_interval == 0) or (epoch_index + 1 == n_epochs)
+
+    if is_evaluation_epoch:
+        statistics = evaluate_validation(
+            validation_samples,
+            raw_operators,
+            batch_size,
+            device,
+            variance_weight,
+            print_spectrum=True,
+        )
+    else:
+        statistics = {
+            "val_loss": train_loss,
+            "val_bias": train_loss,
+            "d_ratio_mean": 0.0,
+            "d_ratio_std": 0.0,
+            "d_th_mean": 0.0,
+            "d_th_std": 0.0,
+        }
+
     elapsed_seconds = time.perf_counter() - start_time
-    print_epoch_statistics(epoch_index, n_epochs, train_loss, statistics, elapsed_seconds)
+    if is_evaluation_epoch:
+        print_epoch_statistics(epoch_index, n_epochs, train_loss, statistics, elapsed_seconds)
+    else:
+        print(
+            f"    Эпоха [{epoch_index + 1:02d}/{n_epochs:02d}] | "
+            f"Train: {train_loss:9.6f} | {elapsed_seconds:5.1f}s"
+        )
+
     append_training_history_entry(
         history, epoch_index + 1, train_loss, statistics, elapsed_seconds
     )
@@ -856,6 +951,7 @@ def fit_qcml_geometry(
     batch_size: int,
     device: torch.device,
     n_epochs: int,
+    target_steps: int | None,
     learning_rate: float,
     variance_weight: float,
     grad_clip_norm: float,
@@ -866,17 +962,16 @@ def fit_qcml_geometry(
     training_samples, validation_samples = split_train_validation(
         meg_samples, validation_fraction, validation_max_samples, batch_size
     )
+    effective_epochs = resolve_epoch_count(
+        n_epochs, target_steps, batch_size, training_samples.shape[0]
+    )
     raw_operators = initialize_operator_parameters(feature_dimension, hilbert_dimension, device)
     optimizer = torch.optim.AdamW([raw_operators], lr=learning_rate)
-    unknown_noise_threshold = unknown_noise_threshold_coefficient(
-        gramian_aspect_ratio(hilbert_dimension, feature_dimension)
-    )
     print_optimization_start(
-        n_epochs,
+        effective_epochs,
         batch_size,
         learning_rate,
         variance_weight,
-        unknown_noise_threshold,
         detach_eigenvectors,
         hilbert_dimension,
         feature_dimension,
@@ -884,7 +979,7 @@ def fit_qcml_geometry(
     history = empty_training_history()
     best_val_loss = float("inf")
     best_epoch_index = 0
-    for epoch_index in range(n_epochs):
+    for epoch_index in range(effective_epochs):
         statistics = run_training_and_validation_epoch(
             training_samples,
             validation_samples,
@@ -895,9 +990,8 @@ def fit_qcml_geometry(
             detach_eigenvectors,
             variance_weight,
             grad_clip_norm,
-            unknown_noise_threshold,
             epoch_index,
-            n_epochs,
+            effective_epochs,
             history,
         )
         if statistics["val_loss"] < best_val_loss:
@@ -905,9 +999,10 @@ def fit_qcml_geometry(
             best_epoch_index = epoch_index + 1
     history["best_val_loss"] = float(best_val_loss)
     history["best_epoch_index"] = int(best_epoch_index)
+    history["effective_epochs"] = int(effective_epochs)
     print(
-        f"[*] Оптимизация завершена. Лучший val_loss: {best_val_loss:.4f} "
-        f"(эпоха {best_epoch_index}/{n_epochs})"
+        f"[*] Оптимизация завершена. Лучший val_loss: {best_val_loss:.6f} "
+        f"(эпоха {best_epoch_index}/{effective_epochs})"
     )
     return raw_operators.detach(), history
 
@@ -962,17 +1057,6 @@ def reduce_takens_channel_leverage(
     return np.mean(reshaped, axis=0)
 
 
-def print_rmt_configuration(
-    aspect_ratio: float,
-    median_under_null: float,
-    threshold_coefficient: float,
-) -> None:
-    print(
-        f"  [RMT] beta = {aspect_ratio:.4f} | MP-медиана mu_beta = {median_under_null:.4f} | "
-        f"omega(beta) = {threshold_coefficient:.4f}"
-    )
-
-
 def fixed_size_eigenvalue_array(
     eigenvalues: np.ndarray,
     gramian_dimension: int,
@@ -987,7 +1071,6 @@ def spectrum_table(
     metric_traces: np.ndarray,
     residuals: np.ndarray,
     ratio_gaps: np.ndarray,
-    rmt_dimensions: np.ndarray,
     ground_eigenvalues: np.ndarray,
     first_eigenvalue_gaps: np.ndarray,
     local_variances: np.ndarray,
@@ -1000,7 +1083,6 @@ def spectrum_table(
             pa.array(metric_traces, type=pa.float64()),
             pa.array(residuals, type=pa.float64()),
             pa.array(ratio_gaps, type=pa.float64()),
-            pa.array(rmt_dimensions, type=pa.float64()),
             pa.array(ground_eigenvalues, type=pa.float64()),
             pa.array(first_eigenvalue_gaps, type=pa.float64()),
             pa.array(local_variances, type=pa.float64()),
@@ -1011,32 +1093,11 @@ def spectrum_table(
             "metric_trace",
             "reconstruction_residual",
             "d_ratio_gap",
-            "d_rmt",
             "ground_eigenvalue",
             "first_eigenvalue_gap",
             "local_variance",
         ],
     )
-
-
-def write_chunk_to_parquet(
-    writer: pq.ParquetWriter,
-    buffers: dict[str, list],
-    gramian_dimension: int,
-) -> None:
-    table = spectrum_table(
-        buffers["sample_indices"],
-        np.concatenate(buffers["eigenvalue_chunks"], axis=0),
-        np.asarray(buffers["metric_traces"], dtype=np.float64),
-        np.asarray(buffers["residuals"], dtype=np.float64),
-        np.asarray(buffers["ratio_gaps"], dtype=np.float64),
-        np.asarray(buffers["rmt_dimensions"], dtype=np.float64),
-        np.asarray(buffers["ground_eigenvalues"], dtype=np.float64),
-        np.asarray(buffers["first_eigenvalue_gaps"], dtype=np.float64),
-        np.asarray(buffers["local_variances"], dtype=np.float64),
-        gramian_dimension,
-    )
-    writer.write_table(table)
 
 
 def spectrum_parquet_schema(gramian_dimension: int) -> pa.Schema:
@@ -1047,7 +1108,6 @@ def spectrum_parquet_schema(gramian_dimension: int) -> pa.Schema:
         ("metric_trace", pa.float64()),
         ("reconstruction_residual", pa.float64()),
         ("d_ratio_gap", pa.float64()),
-        ("d_rmt", pa.float64()),
         ("ground_eigenvalue", pa.float64()),
         ("first_eigenvalue_gap", pa.float64()),
         ("local_variance", pa.float64()),
@@ -1075,7 +1135,6 @@ def empty_inference_buffers() -> dict[str, list]:
         "metric_traces": [],
         "residuals": [],
         "ratio_gaps": [],
-        "rmt_dimensions": [],
         "ground_eigenvalues": [],
         "first_eigenvalue_gaps": [],
         "local_variances": [],
@@ -1091,7 +1150,6 @@ def extend_inference_buffers(
     metric_traces: torch.Tensor,
     residuals: torch.Tensor,
     ratio_gap: torch.Tensor,
-    rmt_dimension: torch.Tensor,
     ground_eigenvalue: torch.Tensor,
     first_eigenvalue_gap: torch.Tensor,
     local_variance: torch.Tensor,
@@ -1103,10 +1161,28 @@ def extend_inference_buffers(
     buffers["metric_traces"].extend(metric_traces.cpu().numpy().tolist())
     buffers["residuals"].extend(residuals.cpu().numpy().tolist())
     buffers["ratio_gaps"].extend(ratio_gap.cpu().numpy().tolist())
-    buffers["rmt_dimensions"].extend(rmt_dimension.cpu().numpy().tolist())
     buffers["ground_eigenvalues"].extend(ground_eigenvalue.cpu().numpy().tolist())
     buffers["first_eigenvalue_gaps"].extend(first_eigenvalue_gap.cpu().numpy().tolist())
     buffers["local_variances"].extend(local_variance.cpu().numpy().tolist())
+
+
+def write_chunk_to_parquet(
+    writer: pq.ParquetWriter,
+    buffers: dict[str, list],
+    gramian_dimension: int,
+) -> None:
+    table = spectrum_table(
+        buffers["sample_indices"],
+        np.concatenate(buffers["eigenvalue_chunks"], axis=0),
+        np.asarray(buffers["metric_traces"], dtype=np.float64),
+        np.asarray(buffers["residuals"], dtype=np.float64),
+        np.asarray(buffers["ratio_gaps"], dtype=np.float64),
+        np.asarray(buffers["ground_eigenvalues"], dtype=np.float64),
+        np.asarray(buffers["first_eigenvalue_gaps"], dtype=np.float64),
+        np.asarray(buffers["local_variances"], dtype=np.float64),
+        gramian_dimension,
+    )
+    writer.write_table(table)
 
 
 def write_and_clear_inference_buffers(
@@ -1115,15 +1191,8 @@ def write_and_clear_inference_buffers(
     gramian_dimension: int,
 ) -> None:
     write_chunk_to_parquet(writer, buffers, gramian_dimension)
-    buffers["sample_indices"].clear()
-    buffers["eigenvalue_chunks"].clear()
-    buffers["metric_traces"].clear()
-    buffers["residuals"].clear()
-    buffers["ratio_gaps"].clear()
-    buffers["rmt_dimensions"].clear()
-    buffers["ground_eigenvalues"].clear()
-    buffers["first_eigenvalue_gaps"].clear()
-    buffers["local_variances"].clear()
+    for key in buffers:
+        buffers[key].clear()
     torch.cuda.empty_cache()
 
 
@@ -1158,34 +1227,14 @@ def project_and_residuals(
     sum_of_squared: torch.Tensor,
 ) -> dict[str, torch.Tensor]:
     projection = project_batch_to_point_cloud(feature_batch, hermitian_operators, sum_of_squared)
-    projection["residuals"] = compute_projection_residuals(feature_batch, projection["projected_batch"])
+    projection["residuals"] = compute_projection_residuals(
+        feature_batch, projection["projected_batch"]
+    )
     return projection
 
 
-def spectrum_and_metric_diagonal(
-    projected_batch: torch.Tensor,
-    hermitian_operators: torch.Tensor,
-    sum_of_squared: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    hamiltonian = core_hamiltonian_for_batch(projected_batch, hermitian_operators, sum_of_squared)
-    ground_eigenvalue, ground_state, excited_eigenvalues, excited_states = ground_and_excited_eigenpairs(hamiltonian)
-    eigenvalue_gaps = compute_eigenvalue_gaps(ground_eigenvalue, excited_eigenvalues)
-    raw_transitions = compute_transition_matrix_elements(ground_state, excited_states, hermitian_operators)
-    scaled_transitions = scale_transition_vectors_by_gap(raw_transitions, eigenvalue_gaps)
-    transition_features = assemble_transition_feature_matrix(scaled_transitions)
-    metric_diagonal = compute_analytic_metric_diagonal(transition_features)
-    metric_traces = torch.sum(metric_diagonal, dim=-1)
-    active_eigenvalues = active_eigenvalues_from_transition_features(transition_features)
-    return active_eigenvalues, metric_diagonal, metric_traces
-
-
-def dimension_estimates(
-    active_eigenvalues: torch.Tensor,
-    unknown_noise_threshold: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    ratio_gap = compute_ratio_gap_dimension(active_eigenvalues)
-    rmt_dimension = compute_rmt_dimension(active_eigenvalues, unknown_noise_threshold)
-    return ratio_gap, rmt_dimension
+def dimension_estimates(active_eigenvalues: torch.Tensor) -> torch.Tensor:
+    return compute_ratio_gap_dimension(active_eigenvalues)
 
 
 @torch.no_grad()
@@ -1193,20 +1242,18 @@ def process_single_inference_chunk(
     feature_batch: torch.Tensor,
     hermitian_operators: torch.Tensor,
     sum_of_squared: torch.Tensor,
-    unknown_noise_threshold: float,
 ) -> dict[str, torch.Tensor]:
     projection = project_and_residuals(feature_batch, hermitian_operators, sum_of_squared)
     active_eigenvalues, metric_diagonal, metric_traces = spectrum_and_metric_diagonal(
         projection["projected_batch"], hermitian_operators, sum_of_squared
     )
-    ratio_gap, rmt_dimension = dimension_estimates(active_eigenvalues, unknown_noise_threshold)
+    ratio_gap = dimension_estimates(active_eigenvalues)
     return {
         "active_eigenvalues": active_eigenvalues,
         "metric_diagonal": metric_diagonal,
         "metric_traces": metric_traces,
         "residuals": projection["residuals"],
         "ratio_gap": ratio_gap,
-        "rmt_dimension": rmt_dimension,
         "ground_eigenvalue": projection["ground_eigenvalue"],
         "first_eigenvalue_gap": projection["first_eigenvalue_gap"],
         "local_variance": projection["local_variance"],
@@ -1219,7 +1266,6 @@ def run_inference_batches(
     writer: pq.ParquetWriter,
     hermitian_operators: torch.Tensor,
     sum_of_squared: torch.Tensor,
-    unknown_noise_threshold: float,
     gramian_dimension: int,
     batch_size: int,
     chunk_flush_size: int,
@@ -1235,7 +1281,7 @@ def run_inference_batches(
             feature_batch = torch.from_numpy(data[batch_start:batch_end]).to(device)
 
             inference_results = process_single_inference_chunk(
-                feature_batch, hermitian_operators, sum_of_squared, unknown_noise_threshold
+                feature_batch, hermitian_operators, sum_of_squared
             )
 
             accumulated_metric_diagonal += (
@@ -1252,7 +1298,6 @@ def run_inference_batches(
                 inference_results["metric_traces"],
                 inference_results["residuals"],
                 inference_results["ratio_gap"],
-                inference_results["rmt_dimension"],
                 inference_results["ground_eigenvalue"],
                 inference_results["first_eigenvalue_gap"],
                 inference_results["local_variance"],
@@ -1277,7 +1322,6 @@ def write_spectrum_to_parquet(
     output_parquet_path: Path,
     hermitian_operators: torch.Tensor,
     sum_of_squared: torch.Tensor,
-    unknown_noise_threshold: float,
     gramian_dimension: int,
     batch_size: int,
     chunk_flush_size: int,
@@ -1290,7 +1334,6 @@ def write_spectrum_to_parquet(
         writer,
         hermitian_operators,
         sum_of_squared,
-        unknown_noise_threshold,
         gramian_dimension,
         batch_size,
         chunk_flush_size,
@@ -1298,6 +1341,11 @@ def write_spectrum_to_parquet(
     )
     close_parquet_writer(writer)
     return accumulated_metric_diagonal
+
+
+def gramian_aspect_ratio(hilbert_dimension: int, feature_dimension: int) -> float:
+    gramian_dimension = 2 * (hilbert_dimension - 1)
+    return min(1.0, gramian_dimension / float(feature_dimension))
 
 
 def stream_dataset_inference(
@@ -1315,11 +1363,8 @@ def stream_dataset_inference(
     physical_channel_count = feature_dimension // takens_embedding_dimension
     gramian_dimension = 2 * (hilbert_dimension - 1)
     aspect_ratio = gramian_aspect_ratio(hilbert_dimension, feature_dimension)
-    unknown_noise_threshold = unknown_noise_threshold_coefficient(aspect_ratio)
-    print_rmt_configuration(
-        aspect_ratio,
-        marchenko_pastur_median(aspect_ratio),
-        unknown_noise_threshold,
+    print(
+        f"  [Метрика] beta = {aspect_ratio:.4f} | ранг(g) <= {gramian_dimension}"
     )
 
     hermitian_operators, sum_of_squared = build_hermitian_and_squared_operators(raw_operators)
@@ -1330,7 +1375,6 @@ def stream_dataset_inference(
         output_parquet_path,
         hermitian_operators,
         sum_of_squared,
-        unknown_noise_threshold,
         gramian_dimension,
         batch_size,
         chunk_flush_size,
@@ -1348,22 +1392,34 @@ def stream_dataset_inference(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="QCML MEG Engine v3")
-    parser.add_argument("--fif_path", type=str, required=True, help="Путь к файлу МЭГ (.fif)")
+    source_group = parser.add_mutually_exclusive_group(required=True)
+    source_group.add_argument("--fif_path", type=str, help="Путь к файлу МЭГ (.fif)")
+    source_group.add_argument(
+        "--synthetic_npz_path",
+        type=str,
+        help="Путь к .npz с синтетическими признаками (ключ 'features')",
+    )
+    parser.add_argument("--synthetic_label", type=str, default=None,
+                        help="Метка для выходных файлов синтетики")
     parser.add_argument("--n_hilbert", type=int, default=24, help="Размерность Гильбертова пространства N")
     parser.add_argument("--takens_m", type=int, default=1, help="Размерность вложения Такенса")
     parser.add_argument("--takens_tau_ms", type=float, default=25.0, help="Задержка Такенса в миллисекундах")
-    parser.add_argument("--norm_mode", type=str, choices=["block_rms", "channel_zscore"], default="block_rms", help="Режим нормализации")
+    parser.add_argument("--norm_mode", type=str, choices=["block_rms", "channel_zscore"],
+                        default="block_rms", help="Режим нормализации")
     parser.add_argument("--w_variance", type=float, default=0.0, help="Вес регуляризации локальной дисперсии")
-    parser.add_argument("--batch_size", type=int, default=512, help="Размер батча")
+    parser.add_argument("--batch_size", type=int, default=2048, help="Размер батча")
     parser.add_argument("--n_epochs", type=int, default=20, help="Число эпох обучения")
+    parser.add_argument("--target_steps", type=int, default=None,
+                        help="Целевой инвариантный бюджет градиентных шагов")
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="Скорость обучения")
     parser.add_argument("--grad_clip_norm", type=float, default=1.0, help="Норма отсечения градиентов")
     parser.add_argument("--chunk_flush_size", type=int, default=50_000, help="Размер буфера сброса в Parquet")
-    parser.add_argument("--val_fraction", type=float, default=0.1, help="Доля валидации от числа сэмплов")
+    parser.add_argument("--val_fraction", type=float, default=0.1, help="Доля валидации")
     parser.add_argument("--val_max_samples", type=int, default=100_000, help="Максимум сэмплов валидации")
     parser.add_argument("--seed", type=int, default=666, help="Сид генераторов случайных чисел")
-    parser.add_argument("--device", type=str, default=None, help="Устройство: cuda или cpu (авто по умолчанию)")
-    parser.add_argument("--detach_eigenvectors", action="store_true", help="Заморозить psi_0 от A (дешевле, менее устойчиво)")
+    parser.add_argument("--device", type=str, default=None, help="Устройство: cuda или cpu")
+    parser.add_argument("--detach_eigenvectors", action="store_true",
+                        help="Заморозить psi_0 от A")
     parser.add_argument("--checkpoint_dir", type=str, default="04_processed_db", help="Папка чекпоинтов")
     parser.add_argument("--output_dir", type=str, default="04_processed_db", help="Папка выходных файлов")
     return parser.parse_args()
@@ -1382,12 +1438,12 @@ def set_random_seeds(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def main() -> None:
-    args = parse_args()
-    device = resolve_device(args.device)
-    set_random_seeds(args.seed)
-
-    fif_path = Path(args.fif_path)
+def load_and_prepare_meg(
+    fif_path: Path,
+    norm_mode: str,
+    takens_m: int,
+    takens_tau_ms: float,
+) -> tuple[np.ndarray, int, dict, list[int], list[int]]:
     recording = load_preprocessed_raw_fif(fif_path)
     sampling_frequency = meg_sampling_frequency(recording)
     magnetometer_indices = magnetometer_channel_indices(recording)
@@ -1397,7 +1453,7 @@ def main() -> None:
     del recording
     gc.collect()
 
-    if args.norm_mode == "channel_zscore":
+    if norm_mode == "channel_zscore":
         normalized_samples, channel_standard_deviations = normalize_channels_by_zscore(raw_samples)
         normalization_parameters = {
             "mode": "channel_zscore",
@@ -1418,18 +1474,65 @@ def main() -> None:
     gc.collect()
 
     lag_samples = (
-        takens_lag_in_samples(args.takens_tau_ms, sampling_frequency)
-        if args.takens_m > 1
+        takens_lag_in_samples(takens_tau_ms, sampling_frequency)
+        if takens_m > 1
         else 0
     )
     embedded_samples, dropped_leading_samples = build_takens_delay_embedding(
-        normalized_samples, args.takens_m, lag_samples
+        normalized_samples, takens_m, lag_samples
     )
     del normalized_samples
     gc.collect()
 
+    return (
+        embedded_samples,
+        dropped_leading_samples,
+        normalization_parameters,
+        magnetometer_indices,
+        gradiometer_indices,
+    )
+
+
+def load_and_prepare_synthetic(
+    npz_path: Path,
+) -> tuple[np.ndarray, int, dict, list[int], list[int]]:
+    embedded_samples = load_synthetic_features(npz_path)
+    normalization_parameters = {
+        "mode": "synthetic",
+        "source": str(npz_path),
+    }
+    return embedded_samples, 0, normalization_parameters, [], []
+
+
+def main() -> None:
+    args = parse_args()
+    device = resolve_device(args.device)
+    set_random_seeds(args.seed)
+
+    if args.fif_path is not None:
+        fif_path = Path(args.fif_path)
+        (
+            embedded_samples,
+            dropped_leading_samples,
+            normalization_parameters,
+            magnetometer_indices,
+            gradiometer_indices,
+        ) = load_and_prepare_meg(
+            fif_path, args.norm_mode, args.takens_m, args.takens_tau_ms
+        )
+        subject_stem = fif_path.stem.replace("_raw_preprocessed", "").replace("_raw", "")
+    else:
+        npz_path = Path(args.synthetic_npz_path)
+        (
+            embedded_samples,
+            dropped_leading_samples,
+            normalization_parameters,
+            magnetometer_indices,
+            gradiometer_indices,
+        ) = load_and_prepare_synthetic(npz_path)
+        subject_stem = args.synthetic_label or npz_path.stem
+
     feature_dimension = embedded_samples.shape[1]
-    subject_stem = fif_path.stem.replace("_raw_preprocessed", "").replace("_raw", "")
     gradient_tag = "detach" if args.detach_eigenvectors else "grad"
     suffix_tag = (
         f"D{feature_dimension}_N{args.n_hilbert}_m{args.takens_m}"
@@ -1449,6 +1552,7 @@ def main() -> None:
 
     if checkpoint_file.exists():
         raw_operators = load_qcml_checkpoint(checkpoint_file, device)
+        print(f"[*] Загружен существующий чекпоинт: {checkpoint_file}")
     else:
         raw_operators, training_history = fit_qcml_geometry(
             embedded_samples,
@@ -1457,6 +1561,7 @@ def main() -> None:
             batch_size=args.batch_size,
             device=device,
             n_epochs=args.n_epochs,
+            target_steps=args.target_steps,
             learning_rate=args.learning_rate,
             variance_weight=args.w_variance,
             grad_clip_norm=args.grad_clip_norm,
